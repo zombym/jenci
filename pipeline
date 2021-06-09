@@ -1,0 +1,192 @@
+import hudson.model.*
+import hudson.console.HyperlinkNote
+import hudson.AbortException
+import groovy.xml.MarkupBuilder
+import groovy.xml.*
+import groovy.util.*
+import groovy.json.*
+
+@Library('pipeline-shared-library') _
+
+// -------------------- DEFINITION ZONE --------------------
+
+gitCredentials = 'ea0734cb-49a9-4e37-a02c-3edb4e875aa8'
+
+servers = [
+        'EPAM-Dev': [
+            'server' : '192.168.1.38',
+            'credentialsID' : '8cfacd94-e77b-4cb9-bee2-8e2987302617',
+            'scheme' : 'orcl',
+            'stage'  : 1,
+            'release': '',
+            'approvalsOperators': '[shd]'
+            ],
+        'EPAM-QA': [
+            'server' : '192.168.1.55',
+            'credentialsID' : '8cfacd94-e77b-4cb9-bee2-8e2987302617',
+            'scheme' : 'orcl',
+            'stage'  : 2,
+            'release': '',
+            'approvalsOperators': '[shd]'
+            ],
+        'TEST-PROD': [
+            'server' : '192.168.1.27',
+            'credentialsID' : '8cfacd94-e77b-4cb9-bee2-8e2987302617',
+            'scheme' : 'orcl',
+            'stage'  : 3,
+            'release': '',
+            'approvalsOperators': '[shd,user2]'
+            ]
+]
+
+// -------------------- END OF DEFINITION ZONE --------------------
+
+envList = []
+
+servers.each {
+    envList.add(it.key)
+}
+
+properties([parameters([choice(choices: envList, name: 'target_env')])])
+
+targetEnv = "${target_env}"
+
+approvalData = [
+	'operators': servers[targetEnv].approvalsOperators,
+	'adUserOrGroup' : '',
+	'target_env' : "${targetEnv}"
+]
+
+node('sqlplus') { 
+        stage('clean WS'){
+            cleanWs()       
+        }
+    
+        stage('checking env releases'){
+            sh 'echo "SELECT CIV_VERS_BULD FROM CMS_INCOMM_VERSION WHERE CIV_BASE_VERS=\'INCOMM_VERSION_CMS\';" > sqlrelease.sql'
+            servers.each {
+                withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: it.value.credentialsID, usernameVariable: 'USERNAMECHK', passwordVariable: 'PASSWORDCHK']]) {    
+
+                    relezeVersion = sh(script: "sqlplus $USERNAMECHK/$PASSWORDCHK@//${it.value.server}:1521/${it.value.scheme} < sqlrelease.sql | grep HOST", returnStdout: true)
+                    it.value.release = relezeVersion.substring(12, 14).toInteger()
+                
+                }
+            }
+            println servers
+        }
+
+	    stage('User approval'){
+                   if ( (servers[targetEnv].stage == 3) ) // if you want to add another stage " || (servers[targetEnv].stage == 3) ) "
+			    	{
+				    	getApproval(approvalData)        	
+       		    	}
+		    }
+    
+        stage('get branch list') {
+            git credentialsId: gitCredentials, url: 'https://github.com/InComm-Software-Development/vms-db-automation.git'
+            newList = sh(script: "git branch -a | grep VMSGPRHOST | awk -F/ '{print \$3}'", returnStdout: true)
+        }
+    
+        stage('choose release'){
+            chooseResult = input message: 'Choose Release', parameters: [choice(choices: newList, name: 'Releases list')]
+        }
+    
+        stage('Check release status'){
+            println servers
+            def count = 0
+            if ( servers[targetEnv].stage != 1 ) {
+                choosenRelease = chooseResult.substring(16, 18).toInteger()
+
+                if ( choosenRelease == (servers[targetEnv].release + 1) ) {
+                    servers.each {
+                        if ( it.value.release == (servers[targetEnv].release + 1) )
+                        {
+                            count++
+                        }
+                    }
+                    if ( (servers[targetEnv].stage - 1 ) == count ){
+                        println "SETUP WILL BE EXECUTED"
+                    }
+                    else {
+                        input "Proper release DIDN'T install on lovel enviroments, do you want to continue anyway?"
+                        //error "This release didn't install on lover enviroments"
+                    }
+                } else 
+                {
+                    input "Proper release DIDN'T install on lovel enviroments, do you want to continue anyway?"
+                    //error "This release didn't install on lover enviroments"
+                }
+            }
+        }
+
+    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId:servers[targetEnv].credentialsID, usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {    
+
+        stage('checkout to release'){
+            sh "git checkout $chooseResult"
+            unzip zipFile: "${chooseResult}.zip"
+            env.VMS_HOME = pwd()
+            dir("$chooseResult"){
+                installPath = pwd()
+                result = sh(script: "sqlplus $USERNAME/$PASSWORD@//${servers[targetEnv].server}:1521/${servers[targetEnv].scheme} < CHECK_ME_FIRST.sql | grep RELEASE", returnStdout: true)
+            }
+        }
+    
+//        stage ("sqlrunner"){
+//            String output = step([$class: 'SQLPlusRunnerBuilder',credentialsId:'8cfacd94-e77b-4cb9-bee2-8e2987302617', instance:"${servers[targetEnv].server}:1521/${servers[targetEnv].scheme}",customOracleHome:'/usr',scriptType:'file', script: "$chooseResult/CHECK_ME_FIRST.sql" ,scriptContent: ''])
+//        }
+    
+        stage('sqlplus'){
+            result = sh(script: "sqlplus $USERNAME/$PASSWORD@//${servers[targetEnv].server}:1521/${servers[targetEnv].scheme} < $installPath/CHECK_ME_FIRST.sql | grep RELEASE", returnStdout: true)
+        }
+    
+        stage('Result'){
+            logErrors = 0
+        
+            if ( result.contains("ALREADY") ) {
+                echo "This RELEASE already installed"
+            
+            // next command ONLY for test purposes
+            //    sh "sqlplus $USERNAME/$PASSWORD@//${servers[targetEnv].server}:1521/${servers[targetEnv].scheme} < ${installPath}/${chooseResult}_ROLLBACK.sql"
+            
+            } else if ( result.contains("EXECUTE") ) {
+                echo "Release ready to execute"
+            
+                sh "sqlplus $USERNAME/$PASSWORD@//${servers[targetEnv].server}:1521/${servers[targetEnv].scheme} < ${installPath}/${chooseResult}.sql > execution.log"
+                
+                logErrors = sh(script: "cat execution.log | grep ORA- | wc -l", returnStdout: true)
+                logErrors = logErrors.toInteger()
+            } else {
+                echo result
+            }
+        }
+    
+        stage('Installation error check'){
+
+            if ( logErrors != 0 ) {
+                archiveArtifacts artifacts: 'execution.log', followSymlinks: false
+                echo "!!!!! ${logErrors} ERRORS exist during update"
+                rollBackCheckResult = sh(script: "sqlplus $USERNAME/$PASSWORD@//${servers[targetEnv].server}:1521/${servers[targetEnv].scheme} < ${installPath}/ROLL_CHECK_ME_FIRST.sql | grep ROLLBACK", returnStdout: true)
+            
+                    if ( rollBackCheckResult.contains("EXECUTE") ) {
+                        echo "ROLLBACK will be executed"
+                        sh "sqlplus $USERNAME/$PASSWORD@//${servers[targetEnv].server}:1521/${servers[targetEnv].scheme} < ${installPath}/${chooseResult}_ROLLBACK.sql"
+                    }  else {
+                        echo "CONTACT FSS Onsite Technical Support"
+                }
+                error "Something gone wrong, rollback was executed, ${logErrors} ERRORS exist during update"
+            } else {
+                echo "all ok"
+            }
+        }
+
+        stage('checking env releases'){
+            sh 'echo "SELECT CIV_VERS_BULD FROM CMS_INCOMM_VERSION WHERE CIV_BASE_VERS=\'INCOMM_VERSION_CMS\';" > sqlrelease.sql'
+            servers.each {
+                relezeVersion = sh(script: "sqlplus $USERNAME/$PASSWORD@//${it.value.server}:1521/${it.value.scheme} < sqlrelease.sql | grep HOST", returnStdout: true)
+                it.value.release = relezeVersion.substring(12, 14).toInteger()
+            }
+            println servers
+        }
+
+    }
+}
